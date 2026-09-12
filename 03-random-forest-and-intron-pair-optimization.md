@@ -205,19 +205,32 @@ Donor + Acceptor + branchpoint 等信息组合以后，是否更像一个真实�
 
 对于 Intron Pair 问题，后续可能需要从多个候选 Donor–Acceptor pair 中选择概率更高的候选，因此排序能力同样值得关注。
 
-## 9. 下一步
+## 9. Random Forest 稳定性检查
 
-目前我准备对几个候选特征方案使用不同的 random_state 重复训练 Random Forest。
+在确定最终特征方案之前，我又遇到了一个问题：之前所有 Random Forest 实验基本都使用 `random_state=42`，因此某一次较高的 F1 可能带有一定偶然性。
 
-因为 Random Forest 本身包含随机抽样过程，只看一次 random_state=42 的结果可能存在偶然性。
+为了避免直接根据一次训练结果选择特征，我保留了 C、D、G 三组候选方案，并分别使用 20 个不同的 random_state 重新训练 Random Forest。
 
-下一步会比较多次训练后的：
+最终结果为：
 
-- mean F1
-- std F1
-- mean AUC
-- std AUC
+| Feature Set | Mean F1 | Std F1 | Mean AUC | Std AUC |
+|---|---:|---:|---:|---:|
+| C | 0.8591 | 0.0152 | 0.9471 | 0.0028 |
+| D | 0.8450 | 0.0118 | 0.9390 | 0.0026 |
+| G | 0.8043 | 0.0177 | 0.9220 | 0.0019 |
 
-如果一个方案不仅平均指标较高，而且标准差较小，说明它在 Random Forest 自身随机性变化下更加稳定。
+之前在单次实验中，D 的 F1 一度高于 C，但重复 20 次以后，C 的平均 F1 和平均 AUC 都是三组中最高的。
 
-这次最大的收获不是把某个指标从多少提高到了多少，而是开始意识到：在机器学习实验中，需要先确认模型到底学到了什么，再去讨论模型的分数是否足够高。
+这让我意识到，只看一次 Random Forest 的结果可能会受到模型内部随机抽样的影响。相比某一次最高分，多次训练后的平均表现和波动情况更适合用来判断一个方案是否稳定。
+
+因此，目前暂时选择 C 作为后续模型比较使用的特征方案，包括：
+
+- Donor 8 bp sequence
+- Acceptor 8 bp sequence
+- acceptor_score
+- intron_length
+- branchpoint_distance
+
+共 67 个输入特征。
+
+这里的选择仍然只基于 Train 和 Validation，Test 数据暂时不参与特征选择和模型调整。下一步准备固定这套特征，再比较不同分类模型的表现。
