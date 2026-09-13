@@ -1,0 +1,1143 @@
+# 04｜把模型真正接进系统：从 DNA 输入到成熟 RNA、蛋白质与后端接口
+
+前面的工作主要集中在模型本身，例如 TSS、PAS、Donor、Acceptor 以及 Intron Pair 的预测。
+
+但是做到这里以后，我遇到了一个很实际的问题：
+
+> 模型能够单独跑出结果，并不代表整个项目已经能够使用。
+
+最终项目需要的不是分别运行几个模型，而是用户输入一段 DNA 后，程序能够自动完成后面的所有步骤，最后直接得到可以展示和继续传递的 RNA、蛋白质结果。
+
+所以这一阶段我没有继续训练新的模型，而是开始把前面已经完成的模型真正连接起来，整理成一个完整的转录预测后端。
+
+---
+
+## 1. 先明确最终程序到底要完成什么
+
+在整合之前，我先重新整理了转录模块的输入和输出。
+
+整个模块的输入其实很简单：
+
+```text
+一条 DNA 序列
+```
+
+但是最终输出不能只是某个模型的预测概率，而应该是：
+
+```text
+候选成熟 RNA
++
+对应的候选蛋白质
+```
+
+因此，我把整个程序整理成下面的流程：
+
+```text
+用户输入 DNA
+      ↓
+DNA 清理与合法性检查
+      ↓
+预测候选转录区域
+      ↓
+预测并处理 Intron
+      ↓
+得到成熟 RNA
+      ↓
+寻找完整 ORF
+      ↓
+翻译蛋白质
+      ↓
+整理候选结果
+      ↓
+返回给前端 / 导出 CSV
+```
+
+这一阶段的重点也从：
+
+```text
+“模型能不能预测”
+```
+
+变成了：
+
+```text
+“几个模型能不能按照正确顺序一起工作”
+```
+
+---
+
+## 2. 统一 DNA 输入
+
+网页中用户输入的 DNA 不一定是非常标准的格式。
+
+例如可能输入：
+
+```text
+ATGCGTACGT
+ATCGATCGAT
+CGATCG
+```
+
+也可能带有空格：
+
+```text
+ATGC GTAC GTAA
+```
+
+甚至可能输入小写：
+
+```text
+atgcgtacgtaa
+```
+
+如果直接把这些内容交给模型，就容易产生问题。
+
+所以我首先增加了 DNA 清理：
+
+```python
+def clean_dna(dna):
+    dna = dna.strip().upper()
+
+    dna = dna.replace(" ", "")
+    dna = dna.replace("\n", "")
+    dna = dna.replace("\r", "")
+    dna = dna.replace("\t", "")
+
+    return dna
+```
+
+这样无论用户输入中有没有换行、空格或者大小写差异，进入模型之前都会统一成：
+
+```text
+ATGCGTACGTA...
+```
+
+---
+
+## 3. 对用户输入进行合法性检查
+
+清理完成以后，还不能直接预测。
+
+因为 DNA 中正常情况下只应该包含：
+
+```text
+A
+T
+C
+G
+```
+
+所以我又增加了：
+
+```python
+def validate_dna(dna):
+    if not dna:
+        return False
+
+    valid_bases = {"A", "T", "C", "G"}
+
+    for base in dna:
+        if base not in valid_bases:
+            return False
+
+    return True
+```
+
+如果用户输入：
+
+```text
+ATGCBXYZ
+```
+
+程序就不会继续运行模型，而是直接返回：
+
+```text
+DNA序列不合法
+```
+
+另外，TSS 和 PAS 模型使用的是 201 bp 输入窗口，因此 DNA 太短时也无法正常扫描。
+
+所以在总预测函数中又加入：
+
+```python
+if len(dna) < 201:
+    return {
+        "success": False,
+        "message": "DNA序列长度不能少于201个碱基",
+        "candidates": []
+    }
+```
+
+这部分虽然和机器学习本身关系不大，但接入真实系统以后才发现，这些输入检查是必须补上的。
+
+---
+
+## 4. 把多个模型按照真实处理顺序连接起来
+
+完成输入处理以后，下一步就是把前面训练好的模型真正连接起来。
+
+目前整个后端会加载 5 个模型：
+
+```text
+tss_cnn_model.pth
+
+pas_cnn_model.pth
+
+splice_donor_cnn_model.pth
+
+splice_acceptor_cnn_model.pth
+
+intron_pair_rf_model_v2.pkl
+```
+
+它们不是同时对 DNA 做同一件事，而是处在不同阶段。
+
+整体关系可以表示为：
+
+```text
+                 DNA
+                  ↓
+        ┌─────────────────┐
+        │ TSS CNN         │
+        │ PAS CNN         │
+        └─────────────────┘
+                  ↓
+           候选转录区域
+                  ↓
+        ┌─────────────────┐
+        │ Donor CNN       │
+        │ Acceptor CNN    │
+        └─────────────────┘
+                  ↓
+        候选 Donor-Acceptor
+                  ↓
+        ┌─────────────────┐
+        │ Intron Pair RF  │
+        └─────────────────┘
+                  ↓
+             Intron
+                  ↓
+              RNA剪接
+                  ↓
+             成熟 RNA
+```
+
+这也是我第一次比较完整地把之前分别训练的模型放进同一个预测程序中。
+
+---
+
+## 5. 同时考虑 DNA 正链和负链
+
+转录并不一定只发生在用户输入 DNA 的正链上。
+
+因此 TSS 和 PAS 扫描时，我同时处理：
+
+```text
+正链 +
+```
+
+以及：
+
+```text
+负链 -
+```
+
+对于负链，首先生成反向互补序列：
+
+```python
+def reverse_complement(dna):
+    complement = {
+        "A": "T",
+        "T": "A",
+        "C": "G",
+        "G": "C"
+    }
+
+    reverse_dna = ""
+
+    for base in reversed(dna):
+        reverse_dna += complement[base]
+
+    return reverse_dna
+```
+
+模型在反向互补序列上完成扫描以后，再把预测位置转换回原始 DNA 坐标。
+
+因此最终候选结果中增加：
+
+```text
+strand
+```
+
+用于表示：
+
+```text
++
+```
+
+或者：
+
+```text
+-
+```
+
+这样前端展示结果时，也能够知道当前候选 RNA 来自哪一条链。
+
+---
+
+## 6. 从 TSS 和 PAS 得到候选转录区域
+
+TSS 和 PAS 模型扫描 DNA 后，会产生很多相邻的高概率位置。
+
+如果把每一个位置都当成独立结果，就会产生大量重复候选。
+
+因此我先对距离比较近的候选位置进行聚类。
+
+例如：
+
+```text
+TSS候选：
+
+100
+103
+108
+112
+```
+
+这些位置距离非常近，可以看作同一个候选区域。
+
+程序会在这一组中保留：
+
+```text
+预测概率最高的位置
+```
+
+作为最终候选。
+
+PAS 也进行相同处理。
+
+完成聚类以后，再根据链方向进行 TSS-PAS 配对。
+
+正链需要满足：
+
+```text
+TSS → PAS
+```
+
+负链则对应相反的基因组坐标方向。
+
+目前程序会给每一个 TSS 寻找转录方向上最近的候选 PAS，从而得到一个候选转录区域。
+
+---
+
+## 7. 每条候选转录区域继续进行剪接预测
+
+这一点是整个系统整合中比较重要的修改。
+
+以前得到 TSS 和 PAS 后，就可以直接截取序列并进行：
+
+```text
+T → U
+```
+
+但是现在加入 Intron 模型以后，这样做已经不够了。
+
+当前处理变成：
+
+```text
+TSS + PAS
+    ↓
+截取候选转录DNA
+    ↓
+Donor预测
+    ↓
+Acceptor预测
+    ↓
+生成候选Intron Pair
+    ↓
+Random Forest打分
+    ↓
+选择最终Intron
+    ↓
+删除Intron
+    ↓
+连接Exon
+    ↓
+成熟RNA
+```
+
+在代码中，每一条候选转录序列都会调用：
+
+```python
+intron_prediction = predict_intron_pairs(
+    transcript_dna
+)
+```
+
+然后取得：
+
+```python
+scored_pairs = intron_prediction[
+    "intron_pairs"
+]
+```
+
+再选择最终互不重叠的 Intron：
+
+```python
+selected_introns = select_non_overlapping_introns(
+    scored_pairs,
+    probability_threshold=0.5
+)
+```
+
+完成剪接后：
+
+```python
+mature_dna = splice_introns(
+    transcript_dna,
+    selected_introns
+)
+```
+
+最后才进行：
+
+```python
+rna_sequence = mature_dna.replace(
+    "T",
+    "U"
+)
+```
+
+因此，现在程序输出的 `rna_sequence` 已经统一表示：
+
+> **预测并完成 Intron 剪接后的成熟 RNA。**
+
+这个字段后面也会作为其他模块使用 RNA 时最重要的接口之一。
+
+---
+
+## 8. 保留剪接前后的信息
+
+为了方便观察模型到底对 RNA 做了什么，我没有只保存最后的 RNA，而是同时保存：
+
+```text
+pre_rna_length
+rna_length
+intron_count
+```
+
+例如：
+
+```text
+pre_rna_length = 1243
+rna_length = 435
+intron_count = 1
+```
+
+这样可以直接看到：
+
+```text
+剪接前长度
+      ↓
+预测 Intron
+      ↓
+剪接后长度
+```
+
+如果：
+
+```text
+intron_count = 0
+```
+
+则表示当前候选转录区域没有最终选择出需要删除的 Intron。
+
+这种设计后来在网页调试时也比较有用，因为可以直接判断剪接模块到底有没有真正进入完整预测流程。
+
+---
+
+## 9. 从成熟 RNA 继续预测蛋白质
+
+得到成熟 RNA 后，我又继续把 RNA→Protein 接到了同一个流程里。
+
+目前程序会扫描 RNA 中所有：
+
+```text
+AUG
+```
+
+起始密码子。
+
+找到 AUG 后，从该位置开始每三个碱基读取一个密码子：
+
+```text
+AUG | GCU | AAA | ...
+```
+
+直到遇到：
+
+```text
+UAA
+UAG
+UGA
+```
+
+中的一个终止密码子。
+
+只有找到完整终止密码子的 ORF 才会作为一个完整候选蛋白质保存。
+
+如果一条 RNA 中存在多个完整 ORF，目前选择：
+
+```text
+最长的完整 ORF
+```
+
+作为主要蛋白质结果。
+
+因此每一条候选 RNA 最后还会得到：
+
+```text
+protein_sequence
+protein_length
+```
+
+如果没有找到完整 ORF，则：
+
+```text
+protein_sequence = ""
+
+protein_length = 0
+```
+
+这里需要注意：
+
+> 没有预测到完整蛋白质并不代表 RNA 预测失败。
+
+RNA 本身仍然可以作为后续模块的结果继续使用。
+
+---
+
+## 10. 最后用一个总函数统一整个流程
+
+为了避免前端或者其他模块分别调用很多函数，我最后使用：
+
+```python
+predict_from_dna()
+```
+
+作为整个转录模块的统一入口。
+
+外部只需要：
+
+```python
+result = predict_from_dna(dna_sequence)
+```
+
+内部就会自动完成：
+
+```text
+clean_dna()
+      ↓
+validate_dna()
+      ↓
+predict_rna_candidates()
+      ↓
+Intron预测与剪接
+      ↓
+translate_rna()
+      ↓
+整理最终结果
+```
+
+最终返回：
+
+```python
+{
+    "success": True,
+    "message": "预测完成",
+    "dna_length": len(dna),
+    "candidate_count": len(final_candidates),
+    "candidates": final_candidates
+}
+```
+
+这样做以后，其他人使用我的模块时就不需要知道内部到底有多少模型。
+
+只需要知道：
+
+```text
+输入：DNA
+
+输出：候选RNA和蛋白质
+```
+
+---
+
+## 11. 统一候选结果的数据格式
+
+为了方便后面的前端和其他模块使用，我把每一个候选结果整理成统一结构。
+
+目前主要包含：
+
+```text
+candidate_id
+strand
+
+tss_position
+pas_position
+
+tss_probability
+pas_probability
+
+pre_rna_length
+rna_length
+intron_count
+
+rna_sequence
+
+protein_length
+protein_sequence
+```
+
+例如：
+
+```json
+{
+    "candidate_id": "TR_001",
+    "strand": "+",
+    "pre_rna_length": 1293,
+    "rna_length": 485,
+    "intron_count": 1,
+    "rna_sequence": "AUG...",
+    "protein_length": 27,
+    "protein_sequence": "MK..."
+}
+```
+
+这里我开始意识到：
+
+> 一个模块除了算法本身，还需要有稳定的数据接口。
+
+如果今天把字段叫 `rna`，明天又改成 `RNA_result`，后面的前端和其他模块就需要不断跟着修改。
+
+所以目前把：
+
+```text
+rna_sequence
+```
+
+确定为成熟 RNA 的主要输出字段。
+
+---
+
+## 12. 把算法封装成 Flask 接口
+
+算法能够通过 Python 函数调用以后，下一步就是让网页能够调用。
+
+因此我在 Flask 中增加了：
+
+```text
+POST /transcription/predict
+```
+
+前端只需要发送：
+
+```json
+{
+    "dna_sequence": "ATGC..."
+}
+```
+
+后端接收到 DNA 后：
+
+```python
+result = predict_from_dna(
+    dna_sequence
+)
+```
+
+然后直接把最终结果返回给前端。
+
+这样就形成了：
+
+```text
+前端
+ ↓
+DNA序列
+ ↓
+Flask接口
+ ↓
+transcription.py
+ ↓
+模型预测
+ ↓
+成熟RNA + Protein
+ ↓
+JSON
+ ↓
+前端
+```
+
+前端不需要直接加载 PyTorch 模型，也不需要了解 Random Forest。
+
+模型全部留在后端完成。
+
+---
+
+## 13. 第一次真正理解“前后端接口”
+
+以前我对接口的理解比较抽象。
+
+这次实际做完以后，可以把它理解得很简单：
+
+前端只需要告诉后端：
+
+```text
+这是用户输入的 DNA
+```
+
+例如：
+
+```json
+{
+    "dna_sequence": "ATGCATGC..."
+}
+```
+
+后端则按照提前约定好的格式回答：
+
+```json
+{
+    "success": true,
+    "candidate_count": 3,
+    "candidates": [
+        {
+            "candidate_id": "TR_001",
+            "rna_sequence": "...",
+            "protein_sequence": "..."
+        }
+    ]
+}
+```
+
+所以前端和后端不需要互相知道内部代码是怎么写的。
+
+双方只需要提前确定：
+
+```text
+传什么
+返回什么
+字段叫什么
+```
+
+这就是这一阶段我对接口最直观的理解。
+
+---
+
+## 14. 增加预测结果下载
+
+除了在网页上展示结果，我还希望预测结果可以直接保存下来。
+
+因此增加了：
+
+```python
+export_prediction_results()
+```
+
+将结果写入：
+
+```text
+transcription_results.csv
+```
+
+CSV 中目前包含：
+
+```text
+candidate_id
+rna_sequence
+protein_sequence
+protein_length
+strand
+tss_position
+pas_position
+pre_rna_length
+rna_length
+intron_count
+```
+
+同时 Flask 增加：
+
+```text
+GET /transcription/download
+```
+
+前端点击：
+
+```text
+下载预测结果
+```
+
+以后，就可以直接下载 CSV 文件。
+
+这样预测结果既可以：
+
+```text
+在网页上查看
+```
+
+也可以：
+
+```text
+保存为文件
+```
+
+还可以继续交给后续模块处理。
+
+---
+
+## 15. 把成熟 RNA 作为模块之间的数据接口
+
+这个项目并不是只有 DNA→RNA 一个模块。
+
+后面还有 miRNA 等其他功能，所以我的 RNA 结果最终还需要能够继续传下去。
+
+因此现在明确：
+
+```text
+rna_sequence
+```
+
+表示：
+
+```text
+经过预测剪接后的成熟 RNA
+```
+
+后续模块如果需要 RNA，可以直接读取：
+
+```python
+candidate["rna_sequence"]
+```
+
+如果一次 DNA 预测产生多个候选：
+
+```text
+TR_001
+TR_002
+TR_003
+...
+```
+
+后续程序也可以遍历：
+
+```text
+candidates
+```
+
+获得每一条成熟 RNA。
+
+这让我发现，系统中的模块连接其实也可以理解成：
+
+```text
+模块A的输出
+      ↓
+约定好的字段
+      ↓
+模块B的输入
+```
+
+因此，一个稳定的输出格式本身就是模块设计的一部分。
+
+---
+
+## 16. 前后端联调时遇到的问题
+
+接口写完以后，我原本以为整个功能就结束了。
+
+但是实际接到网页以后，又出现了一个很典型的问题。
+
+我给结果增加了：
+
+```text
+pre_rna_length
+intron_count
+```
+
+两个字段。
+
+前端也增加了：
+
+```text
+剪接前长度
+Intron数量
+```
+
+两列。
+
+但是网页最开始显示的是空白。
+
+浏览器中查看结果时发现：
+
+```text
+剪接前长度：undefined
+
+Intron数量：undefined
+```
+
+这说明：
+
+> 前端虽然已经写了对应字段，但是它实际收到的后端结果中没有这些值。
+
+---
+
+## 17. 怎么判断问题到底出在前端还是后端？
+
+这次调试让我学到一个比较实用的方法：
+
+**不要看到网页没数据显示，就立刻修改前端。**
+
+我先直接运行 `transcription.py`，确认算法本身已经能够返回：
+
+```text
+pre_rna_length
+rna_length
+intron_count
+```
+
+然后又在 Flask 中打印实际返回给前端的第一条候选结果。
+
+同时检查：
+
+```python
+transcription.__file__
+```
+
+确认 Flask 当前加载的确实是我正在修改的：
+
+```text
+transcription.py
+```
+
+最后重新启动后端，再重新进行预测。
+
+这一次网页成功显示：
+
+```text
+剪接前长度
+成熟RNA长度
+Intron数量
+```
+
+而且部分候选 RNA 的剪接前后长度确实发生了变化。
+
+因此可以确认：
+
+```text
+Intron预测
+   ↓
+RNA剪接
+   ↓
+Flask
+   ↓
+前端
+```
+
+这条链路已经真正打通。
+
+这次问题也让我认识到：
+
+> **修改 Python 文件以后，如果后端仍然运行着旧进程，网页看到的可能仍然是旧结果。**
+
+所以以后遇到类似问题，需要分别检查：
+
+```text
+算法实际输出
+后端实际返回
+浏览器实际收到
+前端实际显示
+```
+
+而不是只盯着页面代码。
+
+---
+
+## 18. 当前完整模块结构
+
+做到这里以后，我的转录模块已经形成了比较清楚的结构：
+
+```text
+用户
+ ↓
+输入DNA
+ ↓
+前端页面
+ ↓
+POST /transcription/predict
+ ↓
+Flask app.py
+ ↓
+predict_from_dna()
+ ↓
+┌────────────────────────────┐
+│ TSS CNN                    │
+│ PAS CNN                    │
+│ Donor CNN                  │
+│ Acceptor CNN               │
+│ Intron Pair Random Forest  │
+└────────────────────────────┘
+ ↓
+候选转录区域
+ ↓
+Intron剪接
+ ↓
+成熟RNA
+ ↓
+ORF翻译
+ ↓
+蛋白质
+ ↓
+JSON返回
+ ↓
+网页展示
+```
+
+同时：
+
+```text
+预测结果
+ ↓
+export_prediction_results()
+ ↓
+transcription_results.csv
+ ↓
+/transcription/download
+ ↓
+用户下载
+```
+
+而成熟 RNA 还可以继续：
+
+```text
+rna_sequence
+ ↓
+后续 miRNA 等模块
+```
+
+到这里，之前单独训练出来的几个模型才真正变成了系统中的一个完整功能。
+
+---
+
+## 19. 目前仍然需要继续优化的地方
+
+虽然系统已经能够完整运行，但目前仍然存在一些问题。
+
+其中比较明显的是：
+
+```text
+一个DNA有时会产生较多候选RNA
+```
+
+目前候选数量主要受到：
+
+```text
+TSS候选
+PAS候选
+TSS-PAS配对
+```
+
+的影响。
+
+所以接下来还需要继续研究：
+
+```text
+如何减少重复TSS/PAS候选
+
+如何改进TSS-PAS配对
+
+如何判断两个高度重叠的候选RNA是否需要同时保留
+
+如何减少重复或非常相似的候选蛋白质
+```
+
+另外，目前蛋白质部分主要完成的是：
+
+```text
+成熟RNA → 完整ORF → 蛋白质序列
+```
+
+还没有继续做可靠的蛋白质名称和功能注释。
+
+因此目前我更愿意把输出准确描述为：
+
+```text
+候选蛋白质序列
+```
+
+而不是直接给它一个可能并不可靠的蛋白质名称。
+
+---
+
+## 20. 这一阶段的收获
+
+这一阶段基本没有重新训练一个“大模型”，但反而让我对整个项目理解得更清楚。
+
+以前我的注意力主要集中在：
+
+```text
+Accuracy是多少？
+
+F1是多少？
+
+模型有没有预测正确？
+```
+
+但真正把模型接进系统以后，才发现还有很多问题需要解决：
+
+```text
+用户输入的数据是否合法？
+
+多个模型应该按照什么顺序调用？
+
+正负链怎么统一处理？
+
+Intron剪接后的RNA怎么保存？
+
+蛋白质应该根据哪一条RNA预测？
+
+结果应该用什么字段返回？
+
+前端怎么知道自己应该读取哪个字段？
+
+其他模块怎么继续使用我的RNA？
+
+模型文件应该放在哪里？
+
+后端实际加载的是不是最新代码？
+```
+
+这些问题单独看都不像“机器学习模型训练”，但如果其中任何一步没有处理好，最终系统就无法正常工作。
+
+所以我现在对一个完整机器学习项目的理解更接近：
+
+```text
+数据
+ ↓
+模型
+ ↓
+规则与后处理
+ ↓
+完整预测流程
+ ↓
+统一接口
+ ↓
+前后端连接
+ ↓
+模块之间的数据传递
+ ↓
+最终可使用的系统
+```
+
+从最开始单独训练模型，到现在能够输入一段 DNA，最终得到成熟 RNA 和候选蛋白质，并通过接口返回给网页，这一阶段算是第一次真正把之前分散的工作连接成了一个完整模块。
+
+下一步准备继续优化 **TSS-PAS 配对和候选 RNA 筛选策略**，让最终返回的候选结果更加合理，同时继续提高整个转录预测流程的稳定性。
